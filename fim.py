@@ -85,4 +85,31 @@ def format_nofim(doc, tokenizer):
     formatted_example = f"{doc}"
     return formatted_example
 
+def apply_fim_transformation(chunk_list, p_psm=0.5):
+    transformed_docs = []
+    for chunk in chunk_list:
+        prefix, middle, suffix = split_document(chunk)
+
+        if middle is not None:
+            if random.random() < p_psm:
+                transformed_doc = format_psm(prefix, middle, suffix, tokenizer)
+            else:
+                transformed_doc = format_spm(prefix, middle, suffix, tokenizer)
+            
+            transformed_docs.append(transformed_doc)
+        else:
+            transformed_doc = format_nofim(chunk, tokenizer)
+            transformed_docs.append(transformed_doc)
+    return transformed_docs
+
+def join_transformed_chunk_docs(transformed_chunk_docs):
+    merged_docs = transformed_chunk_docs[0]
+    if len(transformed_chunk_docs) == 1:
+        return merged_docs
+    for i in range(2, len(transformed_chunk_docs)):
+        merged_docs += eot_token + transformed_chunk_docs[i]
+    return merged_docs
+
+
+
 chunk_ds = chunk_dataset(raw_datasets, chuck_length)
