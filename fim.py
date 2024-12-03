@@ -136,8 +136,7 @@ class FimDataset(Dataset):
         return f"Dataset(num_rows={len(self)})"
     
     def __getitem__(self, index):
-        chunk = self._data[index]["content_chunk"]
-        chunk = str(chunk)
+        chunk = self._data[index]["content_chunk"][0]
         return apply_context_level_fim(chunk)
 
 class CustomTrainer(Trainer):
