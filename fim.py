@@ -1,19 +1,31 @@
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset, concatenate_datasets
 from torch.utils.data import DataLoader
 import pandas as pd
-import random, torch
+import os, random, torch, glob, argparse, datetime
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from pathlib import Path
 
-model_id = "meta-llama/Llama-3.2-3B-Instruct"
+model_id = "Qwen/Qwen2.5-1.5B-Instruct"
 
-prefix_token = "<fim_prefix>"
-middle_token = "<fim_middle>"
-suffix_token = "<fim_suffix>"
+# From: https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/blob/main/tokenizer_config.json
+prefix_token = "<|fim_prefix|>"
+middle_token = "<|fim_middle|>"
+suffix_token = "<|fim_suffix|>"
+pad_token = "<|fim_pad|>"
 eot_token = "<|endoftext|>"
-context_length = 512
+im_start_token = "<|im_start|>"
+im_end_token = "<|im_end|>" # eos_token
+
+context_length = 768
 chuck_length = context_length
 max_len = context_length
+dropped_chunks = 0
+
+validation_split_percentage = 0.1
+
+last_run = "./last_run"
 
 ds_train = load_dataset("huggingface-course/codeparrot-ds-train", split="train")
 ds_valid = load_dataset("huggingface-course/codeparrot-ds-valid", split="validation")
@@ -34,6 +46,7 @@ def chunk_documents(doc_list, chunk_length):
         chunks.append(joined_documents[i:i + chunk_length])
     return chunks
 
+# TODO: This function may need some revision
 def chunk_dataset(raw_datasets, chuck_length):
     train_data = [d["content"] for d in raw_datasets["train"]]
     valid_data = [d["content"] for d in raw_datasets["valid"]]
@@ -57,26 +70,54 @@ def chunk_dataset(raw_datasets, chuck_length):
     return chunk_ds
 
 def split_document(doc, fim_rate=0.5):
-    if random.random() < fim_rate:
-        length = len(doc)
-        prefix_len = random.randint(0, length)
-        suffix_len = random.randint(0, length - prefix_len)
-        middle_len = length - prefix_len - suffix_len
+    global dropped_chunks
+    min_len = 32
+    length = len(doc)
+    if (random.random() < fim_rate) and (length > min_len):
+        # Max len is doc length - 1 - min_len - length of all tokens
+        max_len = length - 1 - min_len - len(f"{im_start_token}user{prefix_token}{suffix_token}{middle_token}{im_end_token}{eot_token}")
+        if max_len < min_len: 
+            dropped_chunks += 1
+            return doc, None, None
+        # Find the last newline before the middle of the document
+        prefix_len = doc.rfind('\n', 0, length // 2) + 1
+        if prefix_len == 0:
+            prefix_len = min_len
+        elif prefix_len + min_len > length:
+            dropped_chunks += 1
+            return doc, None, None
+
+        # Find the first newline after the prefix
+        middle_len = doc.find('\n', prefix_len)
+        if middle_len == -1:
+            middle_len = length
+        else:
+            middle_len -= prefix_len
+
+        if middle_len < min_len: 
+            dropped_chunks += 1
+            return doc, None, None
 
         prefix = doc[:prefix_len]
         middle = doc[prefix_len:prefix_len + middle_len]
         suffix = doc[prefix_len + middle_len:]
+
+        # Ensure start/end on newline
+        newline_index = prefix.find('\n')
+        if newline_index != -1: prefix = prefix[newline_index + 1:]
+        newline_index = suffix.rfind('\n')
+        if newline_index != -1: suffix = suffix[:newline_index + 1]
 
         return prefix, middle, suffix
     else:
         return doc, None, None
 
 def format_psm(prefix, middle, suffix, tokenizer):
-    formatted_example = f"{prefix_token}{prefix}{suffix_token}{suffix}{middle_token}{middle}{eot_token}"
+    formatted_example = f"{im_start_token}user{prefix_token}{prefix}{suffix_token}{suffix}{middle_token}{middle}{im_end_token}{eot_token}"
     return formatted_example
 
 def format_spm(prefix, middle, suffix, tokenizer):
-    formatted_example = f"{prefix_token}{suffix_token}{suffix}{middle_token}{prefix}{middle}{eot_token}"
+    formatted_example = f"{im_start_token}user{prefix_token}{suffix_token}{suffix}{middle_token}{prefix}{middle}{im_end_token}{eot_token}"
     return formatted_example
 
 def format_nofim(doc, tokenizer):
@@ -136,8 +177,7 @@ class FimDataset(Dataset):
         return f"Dataset(num_rows={len(self)})"
     
     def __getitem__(self, index):
-        chunk = self._data[index]["content_chunk"]
-        chunk = str(chunk)
+        chunk = self._data[index]["content_chunk"][0]
         return apply_context_level_fim(chunk)
 
 class CustomTrainer(Trainer):
@@ -173,6 +213,26 @@ class CustomTrainer(Trainer):
             pin_memory=self.args.dataloader_pin_memory,
         )
 
+def load_dataset_from_local_files(dataset_name):
+    files = glob.glob(dataset_name + "/**/*.java", recursive=True)
+    dataset = None
+    for file in tqdm(files):
+        if Path(file).is_file():
+            with open(file, 'r', encoding='utf-8') as f:
+                dataset_item = Dataset.from_dict({"content": [str(f.read())]})
+                if not dataset: 
+                    dataset = dataset_item
+                else:
+                    dataset = concatenate_datasets([dataset, dataset_item])
+
+    pretrain_dataset = dataset.train_test_split(test_size = validation_split_percentage, shuffle=False)
+    pretrain_dataset["valid"] = pretrain_dataset.pop("test")
+    return pretrain_dataset
+
+parser = argparse.ArgumentParser()
+parser.add_argument('source_files')
+args = parser.parse_args()
+raw_datasets = load_dataset_from_local_files(args.source_files)
 chunk_ds = chunk_dataset(raw_datasets, chuck_length)
 train_dataset = FimDataset(chunk_ds["train"])
 eval_dataset = FimDataset(chunk_ds["valid"])
@@ -195,8 +255,21 @@ bnb_config = BitsAndBytesConfig(
 )
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-tokenizer.pad_token = tokenizer.eos_token
+
+# Add special tokens to the tokenizer
+special_tokens = {
+    "pad_token": pad_token,
+    "eos_token": im_end_token,
+    "additional_special_tokens": [im_start_token, im_end_token, prefix_token, middle_token, suffix_token]
+}
+tokenizer.add_special_tokens(special_tokens)
+
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+dt_path = f"./output/{model_id}/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+os.mkdir(dt_path)
+if os.path.islink(last_run): os.remove(last_run)
+os.symlink(dt_path, last_run)
 
 model = AutoModelForCausalLM.from_pretrained(model_id, device_map='auto', quantization_config=bnb_config)
 model.gradient_checkpointing_enable()
@@ -204,22 +277,22 @@ model = prepare_model_for_kbit_training(model)
 model = get_peft_model(model, peft_config)
 
 training_args = TrainingArguments(
-    output_dir=f"./models/{model_id}",
-    logging_dir=f"./logging/{model_id}",
+    output_dir=dt_path,
+    logging_dir=dt_path,
     save_strategy="steps",
-    num_train_epochs=16,
-    save_steps=200,
+    max_steps=1000,
+    save_steps=250,
     do_eval=True,
     eval_strategy="steps",
-    eval_steps=50,
+    eval_steps=200,
     save_total_limit=8,
-    learning_rate=5e-4,
+    learning_rate=1e-4,
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
     bf16=False,
     push_to_hub=False,
     optim="paged_adamw_32bit",
-    max_grad_norm=0.3,
+    max_grad_norm=30,
     weight_decay=0.1,
     lr_scheduler_type="cosine",
     logging_strategy="steps",
@@ -242,3 +315,5 @@ trainer = CustomTrainer(
 trainer.train()
 
 trainer.save_model("finetuned_model")
+
+print("Total dropped chunks: "+str(dropped_chunks))
