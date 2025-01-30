@@ -27,27 +27,23 @@ revision = None
 model = PeftModel.from_pretrained(model, adapter_id, revision=revision, adapter_name="my-adapter")
 model.set_adapter("my-adapter")
 
-stop_token = "<|im_end|>" # eos_token
-#stop_token = "<|eot_id|>"
-#stop_token = "\\n"
-stop_token_id = tokenizer.encode(stop_token)[0]
-
-def get_completion(prefix, suffix, prompt = None):
-    if prompt == None:
-      prompt = f"""<|im_start|>user<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"""
+def ask_llm(prompt):
     if not isinstance(prompt, list):
       prompt = tokenizer(prompt).input_ids
 
     model.eval()
     outputs = model.generate(
         input_ids=torch.tensor([prompt]).cuda(),
-        max_new_tokens=256,
-        temperature=0.4,
+        max_new_tokens=1024,
+        temperature=0.2,
         do_sample=True,
-        eos_token_id=stop_token_id,
-        pad_token_id=4
     )
     return (tokenizer.batch_decode(outputs, skip_special_tokens=False)[0])
+
+def get_completion(prefix, suffix, prompt = None):
+    if prompt == None:
+      prompt = f"""<|im_start|>user<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"""
+    return ask_llm(prompt)
 
 prefix = """
 import com.asml.wfa.hvmintegration.functions.abf.businesslogic.calculationflow.context.DataContainerAwareFlowContext;
@@ -70,3 +66,51 @@ Expected output:
 import com.asml.wfa.hvmintegration.functions.abf.businesslogic.calculationflow.flowelement.CalculateAstigmatismPerSlit;
 \n
 """)
+
+
+print("\n\n")
+
+prefix = """
+    SplineFitter(int segmentCount,
+            int polynomialOrder,
+            double beta) {
+        this.segmentCount = segmentCount;
+        this.polynomialOrder = polynomialOrder;
+        this.beta = beta;
+    }
+
+    /**
+     * Creates a new SplineFitter for existing segments/breaks.
+     * 
+     * @param breaks
+     *            segments.
+     * @param polynomialOrder
+     *            order of the polynomial.
+     * @param beta
+     *            value for robust fitting (recommended: 0).
+     */
+    public SplineFitter(List<Double> breaks,
+            int polynomialOrder,
+            double beta) {
+        this.breaks = breaks;
+        this.segmentCount = breaks.size() - 1;
+"""
+
+suffix = """
+        this.beta = beta;
+    }
+"""
+
+output = get_completion(prefix, suffix)
+
+print("\n\nOUTPUT:")
+print(output)
+print("""\n
+Expected output:
+        this.polynomialOrder = polynomialOrder;
+\n
+""")
+
+#question = "What is the recommended beta for the SplineFitter function?"
+#answer = ask_llm(question)
+#rint(answer)

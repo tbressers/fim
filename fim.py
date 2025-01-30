@@ -79,6 +79,7 @@ def split_document(doc, fim_rate=0.5):
         if max_len < min_len: 
             dropped_chunks += 1
             return doc, None, None
+            
         # Find the last newline before the middle of the document
         prefix_len = doc.rfind('\n', 0, length // 2) + 1
         if prefix_len == 0:
